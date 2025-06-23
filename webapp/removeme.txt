@@ -1,0 +1,341 @@
+from fastapi import FastAPI, Depends
+from fastapi.responses import HTMLResponse
+import os
+import json
+import numpy as np
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import Distance, VectorParams, PointStruct
+from pymongo import MongoClient
+from neo4j import GraphDatabase
+import boto3
+from botocore.client import Config
+import requests
+import psycopg2
+import time
+import logging
+
+app = FastAPI()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# HTML template to serve React app
+try:
+    with open("index.html", "r") as f:
+        html_content = f.read()
+except FileNotFoundError:
+    html_content = "<h1>Error: index.html not found</h1>"
+    logger.error("index.html not found")
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_frontend():
+    return html_content
+
+# Store initialization status
+init_status = {
+    "qdrant": {"status": "pending", "message": "Not initialized"},
+    "mongodb": {"status": "pending", "message": "Not initialized"},
+    "neo4j": {"status": "pending", "message": "Not initialized"},
+    "minio": {"status": "pending", "message": "Not initialized"},
+    "ollama": {"status": "pending", "message": "Not initialized"},
+    "postgres": {"status": "pending", "message": "Not initialized"}
+}
+
+# Initialize services with retry logic
+@app.on_event("startup")
+async def init_services():
+    max_retries = 5
+    # Qdrant: Vector Database
+    try:
+        logger.info("Initializing Qdrant")
+        qdrant_client = QdrantClient(host=os.getenv("QDRANT_HOST"), port=6333)
+        collection_name = "test_collection"
+        qdrant_client.recreate_collection(
+            collection_name=collection_name,
+            vectors_config=VectorParams(size=384, distance=Distance.COSINE)
+        )
+        # Generate embedding using Ollama
+        ollama_url = f"http://{os.getenv('OLLAMA_HOST')}:{os.getenv('EMBEDDER_PORT')}"
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Attempt {attempt + 1} to connect to Ollama embedder")
+                embedding_response = requests.post(f"{ollama_url}/embed", json={"text": "This is a sample document for RAG."}, timeout=10)
+                embedding_response.raise_for_status()
+                embedding = embedding_response.json()["embedding"]
+                break
+            except (requests.exceptions.ConnectionError, requests.exceptions.HTTPError) as e:
+                logger.error(f"Ollama embedder attempt {attempt + 1} failed: {str(e)}")
+                if attempt == max_retries - 1:
+                    init_status["ollama"] = {"status": "error", "message": f"Failed to connect to Ollama embedder: {str(e)}"}
+                    break
+                time.sleep(5)
+        qdrant_client.upsert(
+            collection_name=collection_name,
+            points=[
+                PointStruct(
+                    id=1,
+                    vector=embedding,
+                    payload={"name": "sample_item", "text": "This is a sample document for RAG."}
+                )
+            ]
+        )
+        init_status["qdrant"] = {"status": "success", "message": "Collection created and vector inserted"}
+    except Exception as e:
+        logger.error(f"Qdrant initialization failed: {str(e)}")
+        init_status["qdrant"] = {"status": "error", "message": str(e)}
+
+    # MongoDB: NoSQL Database
+    try:
+        logger.info("Initializing MongoDB")
+        for attempt in range(max_retries):
+            try:
+                mongo_client = MongoClient(f"mongodb://hanna:agenticai2025@{os.getenv('MONGO_HOST')}:27017")
+                db = mongo_client["testdb"]
+                collection = db["test_collection"]
+                collection.insert_one({
+                    "name": "sample_doc",
+                    "vector": embedding
+                })
+                init_status["mongodb"] = {"status": "success", "message": "Document inserted"}
+                break
+            except Exception as e:
+                logger.error(f"MongoDB attempt {attempt + 1} failed: {str(e)}")
+                if attempt == max_retries - 1:
+                    init_status["mongodb"] = {"status": "error", "message": f"Failed to connect to MongoDB: {str(e)}"}
+                    break
+                time.sleep(5)
+    except Exception as e:
+        logger.error(f"MongoDB initialization failed: {str(e)}")
+        init_status["mongodb"] = {"status": "error", "message": str(e)}
+
+    # Neo4j: Knowledge Graph Database
+    try:
+        logger.info("Initializing Neo4j")
+        for attempt in range(max_retries):
+            try:
+                neo4j_driver = GraphDatabase.driver(
+                    f"bolt://{os.getenv('NEO4J_HOST')}:7687",
+                    auth=("neo4j", "agenticai2025")
+                )
+                with neo4j_driver.session() as session:
+                    session.run(
+                        "CREATE (a:Item {name: 'sample_item'})-[:RELATED_TO]->(b:Item {name: 'related_item'})"
+                    )
+                neo4j_driver.close()
+                init_status["neo4j"] = {"status": "success", "message": "Nodes created"}
+                break
+            except Exception as e:
+                logger.error(f"Neo4j attempt {attempt + 1} failed: {str(e)}")
+                if attempt == max_retries - 1:
+                    init_status["neo4j"] = {"status": "error", "message": f"Failed to connect to Neo4j: {str(e)}"}
+                    break
+                time.sleep(5)
+    except Exception as e:
+        logger.error(f"Neo4j initialization failed: {str(e)}")
+        init_status["neo4j"] = {"status": "error", "message": str(e)}
+
+    # MinIO: S3-compatible Block Storage
+    try:
+        logger.info("Initializing MinIO")
+        s3_client = boto3.client(
+            's3',
+            endpoint_url=f"http://{os.getenv('MINIO_HOST')}:9000",
+            aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+            aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+            config=Config(signature_version='s3v4')
+        )
+        bucket_name = "test-bucket"
+        try:
+            s3_client.create_bucket(Bucket=bucket_name)
+            logger.info(f"Created MinIO bucket: {bucket_name}")
+        except (s3_client.exceptions.BucketAlreadyExists, s3_client.exceptions.BucketAlreadyOwnedByYou) as e:
+            logger.info(f"MinIO bucket {bucket_name} already exists, proceeding")
+        sample_data = b"Sample data for MinIO"
+        s3_client.put_object(Bucket=bucket_name, Key="sample.txt", Body=sample_data)
+        init_status["minio"] = {"status": "success", "message": "Bucket created or exists, sample file uploaded"}
+    except Exception as e:
+        logger.error(f"MinIO initialization failed: {str(e)}")
+        init_status["minio"] = {"status": "error", "message": str(e)}
+
+    # PostgreSQL: Relational Database
+    try:
+        logger.info("Initializing PostgreSQL")
+        for attempt in range(max_retries):
+            try:
+                conn = psycopg2.connect(
+                    host=os.getenv("POSTGRES_HOST"),
+                    database="appdb",
+                    user="hanna",
+                    password="agenticai2025"
+                )
+                cur = conn.cursor()
+                cur.execute("INSERT INTO users (username, email) VALUES (%s, %s)", ("test_user", "test@example.com"))
+                conn.commit()
+                cur.close()
+                conn.close()
+                init_status["postgres"] = {"status": "success", "message": "User inserted"}
+                break
+            except Exception as e:
+                logger.error(f"PostgreSQL attempt {attempt + 1} failed: {str(e)}")
+                if attempt == max_retries - 1:
+                    init_status["postgres"] = {"status": "error", "message": f"Failed to connect to PostgreSQL: {str(e)}"}
+                    break
+                time.sleep(5)
+    except Exception as e:
+        logger.error(f"PostgreSQL initialization failed: {str(e)}")
+        init_status["postgres"] = {"status": "error", "message": str(e)}
+
+    # Ollama: LLM and Embedding
+    try:
+        logger.info("Initializing Ollama")
+        ollama_api_url = f"http://{os.getenv('OLLAMA_HOST')}:11434"
+        for attempt in range(max_retries):
+            try:
+                ollama_response = requests.post(f"{ollama_api_url}/api/pull", json={"name": "mistral:7b"})
+                ollama_response.raise_for_status()
+                if ollama_response.status_code == 200:
+                    # Sample RAG
+                    search_result = qdrant_client.search(
+                        collection_name=collection_name,
+                        query_vector=embedding,
+                        limit=1
+                    )
+                    context = search_result[0].payload.get("text", "No context found") if search_result else "No context found"
+                    s3_client.put_object(
+                        Bucket=bucket_name,
+                        Key="rag_context.txt",
+                        Body=context.encode('utf-8')
+                    )
+                    prompt = f"Based on the context: '{context}', summarize the content in one sentence."
+                    llm_response = requests.post(
+                        f"{ollama_api_url}/api/generate",
+                        json={"model": "mistral:7b", "prompt": prompt, "stream": False}
+                    )
+                    init_status["ollama"] = {"status": "success", "message": "Model pulled and RAG completed"}
+                    break
+            except (requests.exceptions.ConnectionError, requests.exceptions.HTTPError) as e:
+                logger.error(f"Ollama attempt {attempt + 1} failed: {str(e)}")
+                if attempt == max_retries - 1:
+                    init_status["ollama"] = {"status": "error", "message": f"Ollama pull failed: {str(e)}"}
+                    break
+                time.sleep(5)
+    except Exception as e:
+        logger.error(f"Ollama initialization failed: {str(e)}")
+        init_status["ollama"] = {"status": "error", "message": str(e)}
+
+# Test endpoints
+@app.get("/test/qdrant")
+async def test_qdrant():
+    try:
+        client = QdrantClient(host=os.getenv("QDRANT_HOST"), port=6333)
+        collection_name = "test_collection"
+        ollama_url = f"http://{os.getenv('OLLAMA_HOST')}:{os.getenv('EMBEDDER_PORT')}"
+        embedding_response = requests.post(f"{ollama_url}/embed", json={"text": "Test query"})
+        embedding_response.raise_for_status()
+        embedding = embedding_response.json()["embedding"]
+        search_result = client.search(
+            collection_name=collection_name,
+            query_vector=embedding,
+            limit=1
+        )
+        return {"status": "success", "message": f"Found {len(search_result)} item(s)"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/test/mongodb")
+async def test_mongodb():
+    try:
+        client = MongoClient(f"mongodb://hanna:agenticai2025@{os.getenv('MONGO_HOST')}:27017")
+        db = client["testdb"]
+        collection = db["test_collection"]
+        result = collection.find_one({"name": "sample_doc"})
+        client.close()
+        return {"status": "success", "message": f"Found document: {result['name'] if result else 'None'}"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/test/neo4j")
+async def test_neo4j():
+    try:
+        driver = GraphDatabase.driver(
+            f"bolt://{os.getenv('NEO4J_HOST')}:7687",
+            auth=("neo4j", "agenticai2025")
+        )
+        with driver.session() as session:
+            result = session.run("MATCH (a:Item)-[:RELATED_TO]->(b) RETURN a.name LIMIT 1").single()
+        driver.close()
+        return {"status": "success", "message": f"Found node: {result['a.name'] if result else 'None'}"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/test/minio")
+async def test_minio():
+    try:
+        s3_client = boto3.client(
+            's3',
+            endpoint_url=f"http://{os.getenv('MINIO_HOST')}:9000",
+            aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+            aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+            config=Config(signature_version='s3v4')
+        )
+        buckets = s3_client.list_buckets().get("Buckets", [])
+        bucket_names = [bucket["Name"] for bucket in buckets]
+        return {"status": "success", "message": f"Found buckets: {bucket_names}"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/test/postgres")
+async def test_postgres():
+    try:
+        conn = psycopg2.connect(
+            host=os.getenv("POSTGRES_HOST"),
+            database="appdb",
+            user="hanna",
+            password="agenticai2025"
+        )
+        cur = conn.cursor()
+        cur.execute("SELECT username FROM users LIMIT 1")
+        result = cur.fetchone()
+        cur.close()
+        conn.close()
+        return {"status": "success", "message": f"Found user: {result[0] if result else 'None'}"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/test/ollama")
+async def test_ollama():
+    try:
+        ollama_url = f"http://{os.getenv('OLLAMA_HOST')}:11434"
+        response = requests.post(
+            f"{ollama_url}/api/generate",
+            json={"model": "mistral:7b", "prompt": "Test prompt", "stream": False}
+        )
+        response.raise_for_status()
+        return {"status": "success", "message": "LLM responded successfully"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+@app.post("/rag")
+async def run_rag(query: dict):
+    query_text = query["text"]
+    ollama_url = f"http://{os.getenv('OLLAMA_HOST')}:{os.getenv('EMBEDDER_PORT')}"
+    try:
+        embedding_response = requests.post(f"{ollama_url}/embed", json={"text": query_text}, timeout=10)
+        embedding_response.raise_for_status()
+        query_vector = embedding_response.json()["embedding"]
+        qdrant_client = QdrantClient(host=os.getenv("QDRANT_HOST"), port=6333)
+        search_result = qdrant_client.search(
+            collection_name="test_collection",
+            query_vector=query_vector,
+            limit=3
+        )
+        context = " ".join([hit.payload.get("text", "") for hit in search_result])
+        prompt = f"Context: {context}\nQuery: {query_text}\nAnswer:"
+        llm_response = requests.post(
+            f"http://{os.getenv('OLLAMA_HOST')}:11434/api/generate",
+            json={"model": "mistral:7b", "prompt": prompt, "stream": False}
+        )
+        llm_response.raise_for_status()
+        return {"status": "success", "response": llm_response.json().get("response")}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
